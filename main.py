@@ -20,6 +20,8 @@ import argparse
 import os
 import subprocess
 import tempfile
+import hashlib
+import time
 from pathlib import Path
 
 import torch
@@ -33,7 +35,29 @@ from tqdm import tqdm
 from asteroid.models import BaseModel
 
 # SpeechBrain embedding model
-from speechbrain.pretrained import EncoderClassifier
+from speechbrain.inference import EncoderClassifier
+
+
+def generate_unique_filename(input_audio_path, target_speaker_path, base_output_dir="output"):
+    """Generate a unique filename based on input files and timestamp."""
+    # Get base names without extensions
+    input_name = Path(input_audio_path).stem
+    target_name = Path(target_speaker_path).stem
+    
+    # Create a hash of the input paths for uniqueness
+    path_hash = hashlib.md5(f"{input_audio_path}_{target_speaker_path}".encode()).hexdigest()[:8]
+    
+    # Add timestamp for additional uniqueness
+    timestamp = int(time.time()) % 100000  # Last 5 digits of timestamp
+    
+    # Create the filename
+    filename = f"{input_name}_extracted_from_{target_name}_{path_hash}_{timestamp}.wav"
+    
+    # Ensure output directory exists
+    output_path = Path(base_output_dir) / filename
+    os.makedirs(output_path.parent, exist_ok=True)
+    
+    return output_path.as_posix()
 
 
 def check_ffmpeg():
@@ -137,25 +161,65 @@ def get_embedding(encoder: EncoderClassifier, wav_24k: torch.Tensor, sr=24000, d
     return emb
 
 
-def separate_chunk(model, chunk_wav: torch.Tensor, device="cpu"):
+def separate_chunk(model, chunk_wav: torch.Tensor, device="cpu", normalization_strength=0.1):
     """
     Run separation on a mono chunk [T] -> list of separated sources [S x T].
     """
     # Model expects [batch, time]
     with torch.no_grad():
         est_sources = model.forward(chunk_wav.unsqueeze(0).to(device))  # [1, S, T]
-    est_sources = est_sources.squeeze(0).cpu()  # [S, T]
-    return [est_sources[i] for i in range(est_sources.shape[0])]
+    
+    # Ensure we get the right shape and handle potential issues
+    if est_sources.dim() == 3:
+        est_sources = est_sources.squeeze(0)  # Remove batch dimension
+    elif est_sources.dim() == 2:
+        # If we only get 2D, assume it's [S, T]
+        pass
+    else:
+        raise RuntimeError(f"Unexpected separation output shape: {est_sources.shape}")
+    
+    # Convert to CPU and normalize each source to prevent extreme values
+    est_sources = est_sources.cpu()
+    
+    # Apply light normalization to each separated source to prevent bass boost
+    def light_norm_source(x, target_rms=None, eps=1e-8):
+        if target_rms is None:
+            target_rms = normalization_strength
+        current_rms = x.pow(2).mean().sqrt()
+        if current_rms > eps:
+            scale_factor = min(target_rms / current_rms, 3.0)  # Max 3x boost for sources
+            return x * scale_factor
+        return x
+    
+    normalized_sources = []
+    for i in range(est_sources.shape[0]):
+        src = est_sources[i]
+        # Check for extreme values that might indicate separation issues
+        if torch.isnan(src).any() or torch.isinf(src).any():
+            print(f"[!] Warning: Source {i} contains NaN or Inf values, skipping")
+            continue
+        
+        # Apply light normalization
+        src_norm = light_norm_source(src)
+        normalized_sources.append(src_norm)
+    
+    if not normalized_sources:
+        # If all sources had issues, return the original chunk as a fallback
+        print(f"[!] All separation sources had issues, using original audio")
+        return [chunk_wav.cpu()]
+    
+    return normalized_sources
 
 
 def main():
     ap = argparse.ArgumentParser(description="Extract target speaker with overlap handling.")
     ap.add_argument("--audio", required=True, help="Input audio file (WAV, FLAC, MP3, OGG, M4A, etc. - ffmpeg fallback for unsupported formats).")
     ap.add_argument("--target-speaker", required=True, help="Audio clip of target speaker (5+ seconds of clean speech, longer clips like 20s work fine). Supports WAV, FLAC, MP3, OGG, M4A, etc.")
-    ap.add_argument("--output", default="target_only.wav", help="Output path for extracted target audio.")
+    ap.add_argument("--output", help="Output path for extracted target audio (auto-generates unique filename if not specified).")
     ap.add_argument("--window-length", type=float, default=15.0, help="Analysis window length in seconds.")
     ap.add_argument("--hop-size", type=float, default=5.0, help="Hop size between windows in seconds.")
     ap.add_argument("--similarity-threshold", type=float, default=0.65, help="Cosine similarity threshold to keep a window (0.0-1.0).")
+    ap.add_argument("--normalization-strength", type=float, default=0.1, help="Audio normalization strength (0.05-0.3, lower = less aggressive, default: 0.1).")
     ap.add_argument("--separation-model", default="JorisCos/ConvTasNet_Libri2Mix_sepclean_16k",
                     help="Asteroid HF model id (2-speaker separation at 16k, will be resampled to 24k).")
     ap.add_argument("--save-segments", action="store_true", help="Also save kept window clips as individual files.")
@@ -181,16 +245,27 @@ def main():
     print(f"[+] Loading input audio: {args.audio}")
     wav, _ = load_wav_mono(args.audio, sr=sr)  # torch [T]
     total_len = wav.shape[0]
+    print(f"[+] Input audio length: {total_len/sr:.2f}s ({total_len} samples)")
 
     print(f"[+] Loading target speaker audio: {args.target_speaker}")
     enroll_wav, _ = load_wav_mono(args.target_speaker, sr=sr)  # torch [T]
+    print(f"[+] Target speaker audio length: {enroll_wav.shape[0]/sr:.2f}s")
 
-    # Normalize (optional but helps)
-    def rms_norm(x, eps=1e-8):
-        return x / (x.pow(2).mean().sqrt() + eps)
+    # Light normalization - avoid aggressive RMS normalization that can cause bass boost
+    def light_norm(x, target_rms=None, eps=1e-8):
+        """Apply light normalization to avoid extreme bass boost."""
+        if target_rms is None:
+            target_rms = args.normalization_strength
+        current_rms = x.pow(2).mean().sqrt()
+        if current_rms > eps:
+            # Scale to target RMS, but limit the scaling factor
+            scale_factor = min(target_rms / current_rms, 5.0)  # Max 5x boost
+            return x * scale_factor
+        return x
 
-    wav = rms_norm(wav)
-    enroll_wav = rms_norm(enroll_wav)
+    # Apply light normalization
+    wav = light_norm(wav)
+    enroll_wav = light_norm(enroll_wav)
 
     # ---- Target embedding
     print("[+] Computing target speaker embedding…")
@@ -198,20 +273,45 @@ def main():
 
     # ---- Process by windows
     kept_chunks = []
+    kept_timestamps = []  # Track which windows were kept
     seg_dir = None
+    
+    # Determine final output path early for directory creation
+    final_output_path = args.output
+    if not final_output_path:
+        final_output_path = generate_unique_filename(args.audio, args.target_speaker)
+        print(f"[+] Auto-generated output filename: {final_output_path}")
+    elif not final_output_path.lower().endswith('.wav'):
+        final_output_path = final_output_path + '.wav'
+    
+    # Create output directory
+    output_dir = Path(final_output_path).parent
+    if output_dir != Path('.'):
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"[+] Created output directory: {output_dir}")
+    
     if args.save_segments:
-        seg_dir = Path(args.output).with_suffix("").as_posix() + "_segments"
+        # Create segments directory inside output directory
+        seg_dir = output_dir / Path(final_output_path).stem + "_segments"
         os.makedirs(seg_dir, exist_ok=True)
+        print(f"[+] Created segments directory: {seg_dir}")
 
+    print(f"[+] Processing {total_len} samples with {win_len} sample windows, {hop_len} sample hops")
+    print(f"[+] Window length: {win_len/sr:.2f}s, Hop size: {hop_len/sr:.2f}s")
+    
+    window_count = 0
+    kept_count = 0
+    
     print("[+] Running separation & selection over windows…")
     for i, (s, e) in enumerate(tqdm(list(chunk_indices(total_len, win_len, hop_len)))):
+        window_count += 1
         chunk = wav[s:e]  # [Twin]
         if chunk.shape[0] < 1000:
             continue  # skip tiny tail
 
         # Separate
         try:
-            sources = separate_chunk(sep_model, chunk, device=device)  # list of [T]
+            sources = separate_chunk(sep_model, chunk, device=device, normalization_strength=args.normalization_strength)  # list of [T]
         except RuntimeError as ex:
             print(f"[!] Separation failed on window {i}: {ex}")
             continue
@@ -228,12 +328,16 @@ def main():
 
         # Keep the best source if above threshold
         if best_sim >= args.similarity_threshold and best_src is not None:
+            kept_count += 1
             kept_chunks.append(best_src.cpu().numpy())
+            kept_timestamps.append((s, e, best_sim))
 
             if args.save_segments:
-                seg_path = Path(seg_dir) / f"seg_{i:05d}_{s}_{e}_sim{best_sim:.3f}.wav"
+                seg_path = seg_dir / f"seg_{i:05d}_{s}_{e}_sim{best_sim:.3f}.wav"
                 sf.write(seg_path.as_posix(), best_src.cpu().numpy(), sr, format='WAV', subtype='PCM_24')
 
+    print(f"[+] Processed {window_count} windows, kept {kept_count} windows above threshold {args.similarity_threshold}")
+    
     if not kept_chunks:
         print("[!] No windows passed the similarity threshold. Try lowering --similarity-threshold.")
         return
@@ -242,6 +346,12 @@ def main():
     # Since windows hop, we just concatenate the chosen target streams.
     # For a fancier reconstruction, you could cross-fade; this keeps it simple.
     target_track = np.concatenate(kept_chunks, axis=0)
+    
+    # Apply final light normalization to the output
+    target_track = light_norm(torch.tensor(target_track)).numpy()
+    
+    print(f"[+] Final output length: {len(target_track)/sr:.2f}s ({len(target_track)} samples)")
+    print(f"[+] Kept windows covered: {kept_timestamps[0][0]/sr:.2f}s to {kept_timestamps[-1][1]/sr:.2f}s")
 
     # Optional: light-weight VAD-like trimming using energy gating
     def energy_trim(x, frame=2048, hop=512, thresh_db=-45.0):
@@ -258,12 +368,8 @@ def main():
 
     # ---- Save result
     # Ensure output is saved as WAV format with 24kHz mono
-    output_path = args.output
-    if not output_path.lower().endswith('.wav'):
-        output_path = output_path + '.wav'
-    
-    sf.write(output_path, target_track, sr, format='WAV', subtype='PCM_24')
-    print(f"[+] Wrote extracted target audio to: {output_path} (24kHz mono WAV)")
+    sf.write(final_output_path, target_track, sr, format='WAV', subtype='PCM_24')
+    print(f"[+] Wrote extracted target audio to: {final_output_path} (24kHz mono WAV)")
     if args.save_segments:
         print(f"[+] Wrote kept segments to: {seg_dir}")
 
