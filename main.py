@@ -216,10 +216,11 @@ def main():
     ap.add_argument("--audio", required=True, help="Input audio file (WAV, FLAC, MP3, OGG, M4A, etc. - ffmpeg fallback for unsupported formats).")
     ap.add_argument("--target-speaker", required=True, help="Audio clip of target speaker (5+ seconds of clean speech, longer clips like 20s work fine). Supports WAV, FLAC, MP3, OGG, M4A, etc.")
     ap.add_argument("--output", help="Output path for extracted target audio (auto-generates unique filename if not specified).")
-    ap.add_argument("--window-length", type=float, default=8.0, help="Analysis window length in seconds (smaller = cleaner separation, default: 8.0).")
-    ap.add_argument("--hop-size", type=float, default=4.0, help="Hop size between windows in seconds (default: 4.0).")
+    ap.add_argument("--window-length", type=float, default=15.0, help="Analysis window length in seconds (larger = more coverage, default: 15.0).")
+    ap.add_argument("--hop-size", type=float, default=5.0, help="Hop size between windows in seconds (default: 5.0).")
     ap.add_argument("--min-overlap", type=float, default=0.0, help="Minimum overlap between windows as fraction (0.0 = no overlap, 0.5 = 50%% overlap, default: 0.0).")
-    ap.add_argument("--similarity-threshold", type=float, default=0.80, help="Cosine similarity threshold to keep a window (0.0-1.0, higher = more strict, default: 0.80).")
+    ap.add_argument("--skip-start", type=float, default=0.0, help="Skip the first N seconds of audio (useful if target speaker doesn't start immediately, default: 0.0).")
+    ap.add_argument("--similarity-threshold", type=float, default=0.85, help="Cosine similarity threshold to keep a window (0.0-1.0, higher = more strict, default: 0.85).")
     ap.add_argument("--normalization-strength", type=float, default=0.05, help="Audio normalization strength (0.05-0.3, lower = less aggressive, default: 0.1).")
     ap.add_argument("--separation-model", default="JorisCos/ConvTasNet_Libri2Mix_sepclean_16k",
                     help="Asteroid HF model id (2-speaker separation at 16k, will be resampled to 24k).")
@@ -309,6 +310,11 @@ def main():
         print(f"[+] Created segments directory: {seg_dir}")
 
     print(f"[+] Processing {total_len} samples with {win_len} sample windows, {hop_len} sample hops")
+    if args.skip_start > 0:
+        skip_samples = int(args.skip_start * sr)
+        print(f"[+] Skipping first {args.skip_start}s ({skip_samples} samples)")
+        total_len = total_len - skip_samples
+        wav = wav[skip_samples:]  # Remove the skipped portion
     print(f"[+] Window length: {win_len/sr:.2f}s, Hop size: {hop_len/sr:.2f}s")
     
     window_count = 0
