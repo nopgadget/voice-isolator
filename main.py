@@ -216,9 +216,10 @@ def main():
     ap.add_argument("--audio", required=True, help="Input audio file (WAV, FLAC, MP3, OGG, M4A, etc. - ffmpeg fallback for unsupported formats).")
     ap.add_argument("--target-speaker", required=True, help="Audio clip of target speaker (5+ seconds of clean speech, longer clips like 20s work fine). Supports WAV, FLAC, MP3, OGG, M4A, etc.")
     ap.add_argument("--output", help="Output path for extracted target audio (auto-generates unique filename if not specified).")
-    ap.add_argument("--window-length", type=float, default=15.0, help="Analysis window length in seconds.")
-    ap.add_argument("--hop-size", type=float, default=5.0, help="Hop size between windows in seconds.")
-    ap.add_argument("--similarity-threshold", type=float, default=0.8, help="Cosine similarity threshold to keep a window (0.0-1.0, higher = more strict, default: 0.75).")
+    ap.add_argument("--window-length", type=float, default=8.0, help="Analysis window length in seconds (smaller = cleaner separation, default: 8.0).")
+    ap.add_argument("--hop-size", type=float, default=4.0, help="Hop size between windows in seconds (default: 4.0).")
+    ap.add_argument("--min-overlap", type=float, default=0.0, help="Minimum overlap between windows as fraction (0.0 = no overlap, 0.5 = 50%% overlap, default: 0.0).")
+    ap.add_argument("--similarity-threshold", type=float, default=0.80, help="Cosine similarity threshold to keep a window (0.0-1.0, higher = more strict, default: 0.80).")
     ap.add_argument("--normalization-strength", type=float, default=0.05, help="Audio normalization strength (0.05-0.3, lower = less aggressive, default: 0.1).")
     ap.add_argument("--separation-model", default="JorisCos/ConvTasNet_Libri2Mix_sepclean_16k",
                     help="Asteroid HF model id (2-speaker separation at 16k, will be resampled to 24k).")
@@ -229,7 +230,18 @@ def main():
     device = "cuda" if (torch.cuda.is_available() and not args.cpu_only) else "cpu"
     sr = 24000
     win_len = int(args.window_length * sr)
-    hop_len = int(args.hop_size * sr)
+    
+    # Calculate hop size based on overlap preference
+    if args.min_overlap > 0.0:
+        # If min_overlap is specified, calculate hop size to achieve that overlap
+        overlap_samples = int(args.min_overlap * win_len)
+        hop_len = win_len - overlap_samples
+    else:
+        # Use the specified hop size
+        hop_len = int(args.hop_size * sr)
+    
+    # Ensure hop size is at least 1 sample
+    hop_len = max(1, hop_len)
 
     # ---- Load models
     print(f"[+] Loading separation model: {args.separation_model} on {device}")
@@ -331,16 +343,23 @@ def main():
 
         # Keep the best source if above threshold
         if best_sim >= args.similarity_threshold and best_src is not None:
-            # Check if this chunk is too similar to the previous one (prevent duplicates)
+            # Enhanced duplicate detection - check against last few chunks, not just the previous one
+            is_duplicate = False
             if kept_chunks and len(kept_chunks) > 0:
-                prev_chunk = kept_chunks[-1]
-                # Simple similarity check to avoid nearly identical consecutive chunks
-                if len(prev_chunk) == len(best_src.cpu().numpy()):
-                    chunk_sim = cosine_similarity(prev_chunk, best_src.cpu().numpy())
-                    if chunk_sim > 0.95:  # If chunks are 95% similar, skip this one
-                        if i < 10:  # Debug output
-                            print(f"[!] Window {i}: Skipped duplicate chunk (similarity to previous: {chunk_sim:.3f})")
-                        continue
+                # Check against the last 3 chunks to catch more duplicates
+                for check_idx in range(max(0, len(kept_chunks) - 3), len(kept_chunks)):
+                    prev_chunk = kept_chunks[check_idx]
+                    # Only compare if lengths are similar (within 10%)
+                    if abs(len(prev_chunk) - len(best_src.cpu().numpy())) / len(prev_chunk) < 0.1:
+                        chunk_sim = cosine_similarity(prev_chunk, best_src.cpu().numpy())
+                        if chunk_sim > 0.90:  # Lowered threshold to catch more duplicates
+                            if i < 10:  # Debug output
+                                print(f"[!] Window {i}: Skipped duplicate chunk (similarity to chunk {check_idx}: {chunk_sim:.3f})")
+                            is_duplicate = True
+                            break
+            
+            if is_duplicate:
+                continue
             
             kept_count += 1
             kept_chunks.append(best_src.cpu().numpy())
