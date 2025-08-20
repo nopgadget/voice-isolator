@@ -204,9 +204,9 @@ def separate_chunk(model, chunk_wav: torch.Tensor, device="cpu", normalization_s
         normalized_sources.append(src_norm)
     
     if not normalized_sources:
-        # If all sources had issues, return the original chunk as a fallback
-        print(f"[!] All separation sources had issues, using original audio")
-        return [chunk_wav.cpu()]
+        # Don't fall back to original audio - this could include non-target speech
+        print(f"[!] All separation sources had issues, skipping this window")
+        return []
     
     return normalized_sources
 
@@ -218,8 +218,8 @@ def main():
     ap.add_argument("--output", help="Output path for extracted target audio (auto-generates unique filename if not specified).")
     ap.add_argument("--window-length", type=float, default=15.0, help="Analysis window length in seconds.")
     ap.add_argument("--hop-size", type=float, default=5.0, help="Hop size between windows in seconds.")
-    ap.add_argument("--similarity-threshold", type=float, default=0.65, help="Cosine similarity threshold to keep a window (0.0-1.0).")
-    ap.add_argument("--normalization-strength", type=float, default=0.1, help="Audio normalization strength (0.05-0.3, lower = less aggressive, default: 0.1).")
+    ap.add_argument("--similarity-threshold", type=float, default=0.8, help="Cosine similarity threshold to keep a window (0.0-1.0, higher = more strict, default: 0.75).")
+    ap.add_argument("--normalization-strength", type=float, default=0.05, help="Audio normalization strength (0.05-0.3, lower = less aggressive, default: 0.1).")
     ap.add_argument("--separation-model", default="JorisCos/ConvTasNet_Libri2Mix_sepclean_16k",
                     help="Asteroid HF model id (2-speaker separation at 16k, will be resampled to 24k).")
     ap.add_argument("--save-segments", action="store_true", help="Also save kept window clips as individual files.")
@@ -319,22 +319,46 @@ def main():
         # Compute embeddings for each source & score
         best_sim = -1.0
         best_src = None
-        for src in sources:
+        best_source_idx = -1
+        
+        for src_idx, src in enumerate(sources):
             emb = get_embedding(enc, src, sr=sr, device=device)
             sim = cosine_similarity(target_emb, emb)
             if sim > best_sim:
                 best_sim = sim
                 best_src = src
+                best_source_idx = src_idx
 
         # Keep the best source if above threshold
         if best_sim >= args.similarity_threshold and best_src is not None:
+            # Check if this chunk is too similar to the previous one (prevent duplicates)
+            if kept_chunks and len(kept_chunks) > 0:
+                prev_chunk = kept_chunks[-1]
+                # Simple similarity check to avoid nearly identical consecutive chunks
+                if len(prev_chunk) == len(best_src.cpu().numpy()):
+                    chunk_sim = cosine_similarity(prev_chunk, best_src.cpu().numpy())
+                    if chunk_sim > 0.95:  # If chunks are 95% similar, skip this one
+                        if i < 10:  # Debug output
+                            print(f"[!] Window {i}: Skipped duplicate chunk (similarity to previous: {chunk_sim:.3f})")
+                        continue
+            
             kept_count += 1
             kept_chunks.append(best_src.cpu().numpy())
             kept_timestamps.append((s, e, best_sim))
+            
+            # Debug output for first few windows to help diagnose issues
+            if kept_count <= 5:
+                print(f"[+] Window {i}: Kept source {best_source_idx} with similarity {best_sim:.3f} (time: {s/sr:.1f}s-{e/sr:.1f}s)")
+            elif kept_count == 6:
+                print(f"[+] ... (similar debug output continues for remaining windows)")
 
             if args.save_segments:
                 seg_path = seg_dir / f"seg_{i:05d}_{s}_{e}_sim{best_sim:.3f}.wav"
                 sf.write(seg_path.as_posix(), best_src.cpu().numpy(), sr, format='WAV', subtype='PCM_24')
+        else:
+            # Debug output for rejected windows
+            if i < 10:  # Show first 10 rejected windows
+                print(f"[!] Window {i}: Rejected (best similarity: {best_sim:.3f}, threshold: {args.similarity_threshold})")
 
     print(f"[+] Processed {window_count} windows, kept {kept_count} windows above threshold {args.similarity_threshold}")
     
