@@ -219,7 +219,7 @@ def main():
     ap.add_argument("--window-length", type=float, default=15.0, help="Analysis window length in seconds (larger = more coverage, default: 15.0).")
     ap.add_argument("--hop-size", type=float, default=5.0, help="Hop size between windows in seconds (default: 5.0).")
     ap.add_argument("--min-overlap", type=float, default=0.0, help="Minimum overlap between windows as fraction (0.0 = no overlap, 0.5 = 50%% overlap, default: 0.0).")
-    ap.add_argument("--skip-start", type=float, default=30, help="Skip the first N seconds of audio (useful if target speaker doesn't start immediately, default: 0.0).")
+    ap.add_argument("--skip-start", type=float, default=0.0, help="Skip the first N seconds of audio (useful if target speaker doesn't start immediately, default: 0.0).")
     ap.add_argument("--similarity-threshold", type=float, default=0.80, help="Cosine similarity threshold to keep a window (0.0-1.0, higher = more strict, default: 0.85).")
     ap.add_argument("--normalization-strength", type=float, default=0.05, help="Audio normalization strength (0.05-0.3, lower = less aggressive, default: 0.1).")
     ap.add_argument("--separation-model", default="JorisCos/ConvTasNet_Libri2Mix_sepclean_16k",
